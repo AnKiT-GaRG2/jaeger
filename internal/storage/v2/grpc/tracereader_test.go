@@ -639,20 +639,6 @@ func TestConvertMapToKeyValueList(t *testing.T) {
 			expected:   []*storage.KeyValue{},
 		},
 		{
-			name: "empty value",
-			attributes: func() pcommon.Map {
-				m := pcommon.NewMap()
-				m.PutEmpty("key1")
-				return m
-			}(),
-			expected: []*storage.KeyValue{
-				{
-					Key:   "key1",
-					Value: nil,
-				},
-			},
-		},
-		{
 			name: "primitive types",
 			attributes: func() pcommon.Map {
 				m := pcommon.NewMap()
@@ -775,10 +761,64 @@ func TestConvertMapToKeyValueList(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			result := convertMapToKeyValueList(test.attributes)
+			result, err := convertMapToKeyValueList(test.attributes)
+			require.NoError(t, err)
 			require.Equal(t, test.expected, result)
 		})
 	}
+}
+
+// TestConvertMapToKeyValueList_RejectsValuesWithNoWireForm pins that an empty value is refused
+// instead of being dropped, so the server never runs a query that asks for less than the caller wrote.
+func TestConvertMapToKeyValueList_RejectsValuesWithNoWireForm(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes func() pcommon.Map
+		wantErr    string
+	}{
+		{
+			name: "empty value",
+			attributes: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutStr("ok", "v")
+				m.PutEmpty("empty_attr")
+				return m
+			},
+			wantErr: `attribute "empty_attr": cannot send a value of type Empty`,
+		},
+		{
+			name: "empty value inside a slice",
+			attributes: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutEmptySlice("list").AppendEmpty()
+				return m
+			},
+			wantErr: `attribute "list": element 0: cannot send a value of type Empty`,
+		},
+		{
+			name: "empty value inside a map",
+			attributes: func() pcommon.Map {
+				m := pcommon.NewMap()
+				m.PutEmptyMap("obj").PutEmpty("inner")
+				return m
+			},
+			wantErr: `attribute "obj": key "inner": cannot send a value of type Empty`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := convertMapToKeyValueList(test.attributes())
+			require.EqualError(t, err, test.wantErr)
+			require.Nil(t, got)
+		})
+	}
+}
+
+func TestToProtoQueryParameters_RejectsEmptyAttribute(t *testing.T) {
+	attrs := pcommon.NewMap()
+	attrs.PutEmpty("empty_attr")
+	_, err := toProtoQueryParameters(tracestore.TraceQueryParams{Attributes: attrs})
+	require.ErrorContains(t, err, `cannot send the query attributes: attribute "empty_attr"`)
 }
 
 func TestTraceReader_FindTraceSummaries_Success(t *testing.T) {

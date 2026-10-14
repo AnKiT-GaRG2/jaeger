@@ -334,10 +334,14 @@ func toProtoQueryParameters(t tracestore.TraceQueryParams) (*storage.TraceQueryP
 	if t.SearchDepth > tracestore.MaxSearchDepth {
 		return nil, fmt.Errorf("SearchDepth must be in [0, %d]", tracestore.MaxSearchDepth)
 	}
+	attributes, err := convertMapToKeyValueList(t.Attributes)
+	if err != nil {
+		return nil, fmt.Errorf("cannot send the query attributes: %w", err)
+	}
 	q := &storage.TraceQueryParameters{
 		ServiceName:   t.ServiceName,
 		OperationName: t.OperationName,
-		Attributes:    convertMapToKeyValueList(t.Attributes),
+		Attributes:    attributes,
 		StartTimeMin:  t.StartTimeMin,
 		StartTimeMax:  t.StartTimeMax,
 		DurationMin:   t.DurationMin,
@@ -354,55 +358,68 @@ func toProtoQueryParameters(t tracestore.TraceQueryParams) (*storage.TraceQueryP
 	return q, nil
 }
 
-func convertMapToKeyValueList(m pcommon.Map) []*storage.KeyValue {
+// convertMapToKeyValueList encodes attributes for the remote server. A value that has no wire form,
+// such as an empty one, is an error: dropping it would send a query that quietly asks for less than
+// the caller wrote.
+func convertMapToKeyValueList(m pcommon.Map) ([]*storage.KeyValue, error) {
 	keyValues := make([]*storage.KeyValue, 0, m.Len())
+	var convErr error
 	m.Range(func(k string, v pcommon.Value) bool {
-		keyValues = append(keyValues, &storage.KeyValue{
-			Key:   k,
-			Value: convertValueToAnyValue(v),
-		})
+		value, err := convertValueToAnyValue(v)
+		if err != nil {
+			convErr = fmt.Errorf("attribute %q: %w", k, err)
+			return false
+		}
+		keyValues = append(keyValues, &storage.KeyValue{Key: k, Value: value})
 		return true
 	})
-	return keyValues
+	if convErr != nil {
+		return nil, convErr
+	}
+	return keyValues, nil
 }
 
-func convertValueToAnyValue(v pcommon.Value) *storage.AnyValue {
+func convertValueToAnyValue(v pcommon.Value) (*storage.AnyValue, error) {
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
 		return &storage.AnyValue{
 			Value: &storage.AnyValue_StringValue{
 				StringValue: v.Str(),
 			},
-		}
+		}, nil
 	case pcommon.ValueTypeBool:
 		return &storage.AnyValue{
 			Value: &storage.AnyValue_BoolValue{
 				BoolValue: v.Bool(),
 			},
-		}
+		}, nil
 	case pcommon.ValueTypeInt:
 		return &storage.AnyValue{
 			Value: &storage.AnyValue_IntValue{
 				IntValue: v.Int(),
 			},
-		}
+		}, nil
 	case pcommon.ValueTypeDouble:
 		return &storage.AnyValue{
 			Value: &storage.AnyValue_DoubleValue{
 				DoubleValue: v.Double(),
 			},
-		}
+		}, nil
 	case pcommon.ValueTypeBytes:
 		return &storage.AnyValue{
 			Value: &storage.AnyValue_BytesValue{
 				BytesValue: v.Bytes().AsRaw(),
 			},
-		}
+		}, nil
 	case pcommon.ValueTypeSlice:
 		arr := v.Slice()
 		arrayValues := make([]*storage.AnyValue, 0, arr.Len())
 		for i := 0; i < arr.Len(); i++ {
-			arrayValues = append(arrayValues, convertValueToAnyValue(arr.At(i)))
+			elem, err := convertValueToAnyValue(arr.At(i))
+			if err != nil {
+				return nil, fmt.Errorf("element %d: %w", i, err)
+			}
+			arrayValues = append(arrayValues, elem)
 		}
 		return &storage.AnyValue{
 			Value: &storage.AnyValue_ArrayValue{
@@ -410,18 +427,24 @@ func convertValueToAnyValue(v pcommon.Value) *storage.AnyValue {
 					Values: arrayValues,
 				},
 			},
-		}
+		}, nil
 	case pcommon.ValueTypeMap:
 		kvList := &storage.KeyValueList{}
+		var convErr error
 		v.Map().Range(func(k string, val pcommon.Value) bool {
-			kvList.Values = append(kvList.Values, &storage.KeyValue{
-				Key:   k,
-				Value: convertValueToAnyValue(val),
-			})
+			value, err := convertValueToAnyValue(val)
+			if err != nil {
+				convErr = fmt.Errorf("key %q: %w", k, err)
+				return false
+			}
+			kvList.Values = append(kvList.Values, &storage.KeyValue{Key: k, Value: value})
 			return true
 		})
-		return &storage.AnyValue{Value: &storage.AnyValue_KvlistValue{KvlistValue: kvList}}
+		if convErr != nil {
+			return nil, convErr
+		}
+		return &storage.AnyValue{Value: &storage.AnyValue_KvlistValue{KvlistValue: kvList}}, nil
 	default:
-		return nil
+		return nil, fmt.Errorf("cannot send a value of type %s", v.Type())
 	}
 }
